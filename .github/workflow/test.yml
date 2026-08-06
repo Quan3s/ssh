@@ -1,0 +1,150 @@
+name: SSH Tunnel buils
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_password:
+        description: 'Mật khẩu SSH (để trống = tự tạo ngẫu nhiên)'
+        required: false
+        default: ''
+      ssh_public_key:
+        description: 'Public key (~/.ssh/id_rsa.pub) — để trống nếu dùng password'
+        required: false
+        default: ''
+      bore_server:
+        description: 'Bore server'
+        required: false
+        default: 'bore.pub'
+      bore_port:
+        description: 'Remote port (0 = tự động)'
+        required: false
+        default: '0'
+      session_duration:
+        description: 'Thời gian giữ tunnel (phút, tối đa 360)'
+        required: false
+        default: '60'
+
+jobs:
+  ssh-tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ── 1. Cài bore-cli ──────────────────────────────────────────────────
+      - name: Install bore
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/ekzhang/bore/releases/latest \
+            | grep tag_name | cut -d'"' -f4 | tr -d 'v')
+          curl -sSL "https://github.com/ekzhang/bore/releases/download/v${LATEST}/bore-v${LATEST}-x86_64-unknown-linux-musl.tar.gz" \
+            -o bore.tar.gz 2>/dev/null || \
+          curl -sSL "https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz" \
+            -o bore.tar.gz
+          tar -xzf bore.tar.gz
+          chmod +x bore && sudo mv bore /usr/local/bin/bore
+          bore --version
+
+      # ── 2. Thiết lập SSH server ───────────────────────────────────────────
+      - name: Setup SSH server
+        run: |
+          sudo apt-get install -y -q openssh-server
+          sudo mkdir -p /var/run/sshd
+          sudo tee /etc/ssh/sshd_config.d/runner.conf > /dev/null <<'EOF'
+          PasswordAuthentication yes
+          PermitRootLogin yes
+          PubkeyAuthentication yes
+          GatewayPorts yes
+          AllowTcpForwarding yes
+          X11Forwarding no
+          PrintMotd no
+          EOF
+          sudo service ssh restart
+
+      # ── 3. Đặt mật khẩu SSH ──────────────────────────────────────────────
+      - name: Set SSH credentials
+        run: |
+          # Ưu tiên: input khi run > tự tạo ngẫu nhiên
+          INPUT_PASS="${{ github.event.inputs.ssh_password }}"
+          if [ -n "${INPUT_PASS}" ]; then
+            PASSWORD="${INPUT_PASS}"
+          else
+            PASSWORD=$(openssl rand -base64 12)
+          fi
+          echo "runner:${PASSWORD}" | sudo chpasswd
+          echo "SSH_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+
+          # Public key nếu có nhập
+          INPUT_KEY="${{ github.event.inputs.ssh_public_key }}"
+          if [ -n "${INPUT_KEY}" ]; then
+            mkdir -p ~/.ssh
+            echo "${INPUT_KEY}" >> ~/.ssh/authorized_keys
+            chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+            echo "✅ Public key đã được thêm"
+          fi
+
+      # ── 4. Mở bore tunnel ─────────────────────────────────────────────────
+      - name: Start bore tunnel
+        run: |
+          BORE_SERVER="${{ github.event.inputs.bore_server }}"
+          REMOTE_PORT="${{ github.event.inputs.bore_port }}"
+
+          bore local 22 --to "${BORE_SERVER}" --port "${REMOTE_PORT}" \
+            > /tmp/bore.log 2>&1 &
+          BORE_PID=$!
+          echo "BORE_PID=${BORE_PID}" >> $GITHUB_ENV
+
+          sleep 4
+          cat /tmp/bore.log
+
+          ASSIGNED_PORT=$(grep -oP 'listening at .*?:\K[0-9]+' /tmp/bore.log | head -1)
+          [ -z "${ASSIGNED_PORT}" ] && \
+            ASSIGNED_PORT=$(grep -oP 'remote_port=\K[0-9]+' /tmp/bore.log | head -1)
+          echo "ASSIGNED_PORT=${ASSIGNED_PORT}" >> $GITHUB_ENV
+
+      # ── 5. Hiển thị thông tin kết nối ─────────────────────────────────────
+      - name: Print connection info
+        run: |
+          BORE_SERVER="${{ github.event.inputs.bore_server }}"
+          DURATION="${{ github.event.inputs.session_duration }}"
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║           🔐 SSH TUNNEL ĐANG HOẠT ĐỘNG                  ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║                                                          ║"
+          printf "║  %-56s║\n" "  Lệnh kết nối:"
+          printf "║  %-56s║\n" "  ssh runner@${BORE_SERVER} -p ${ASSIGNED_PORT}"
+          echo "║                                                          ║"
+          printf "║  %-56s║\n" "  User:     runner"
+          printf "║  %-56s║\n" "  Password: ${SSH_PASSWORD}"
+          printf "║  %-56s║\n" "  Host:     ${BORE_SERVER}"
+          printf "║  %-56s║\n" "  Port:     ${ASSIGNED_PORT}"
+          echo "║                                                          ║"
+          printf "║  ⏱  %-53s║\n" "Session tối đa: ${DURATION} phút"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          echo ""
+
+      # ── 6. Giữ tunnel sống ────────────────────────────────────────────────
+      - name: Keep tunnel 
+        run: |
+          DURATION="${{ github.event.inputs.session_duration }}"
+          BORE_SERVER="${{ github.event.inputs.bore_server }}"
+          TOTAL=$((DURATION * 60))
+
+          echo "⏳ Tunnel sẽ đóng sau ${DURATION} phút. Cancel workflow để thoát sớm."
+
+          for i in $(seq 1 $((TOTAL / 30))); do
+            sleep 30
+            ELAPSED=$((i * 30))
+            REMAIN=$((TOTAL - ELAPSED))
+            echo "[$(date '+%H:%M:%S')] Đang chạy... còn ${REMAIN}s"
+
+            # Tự restart bore nếu crash
+            if ! kill -0 $BORE_PID 2>/dev/null; then
+              echo "⚠️  bore crash, đang restart..."
+              bore local 22 --to "${BORE_SERVER}" --port "${ASSIGNED_PORT}" \
+                >> /tmp/bore.log 2>&1 &
+              BORE_PID=$!
+            fi
+          done
+
+          echo "✅ Session kết thúc."
